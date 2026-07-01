@@ -233,54 +233,88 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 - **Reproducibility**: Two `CASTLE` instances with the same `seed` and hyperparameters, fit on the same data, produce byte-identical `adjacency_matrix_` values.
 
 # GraN-DAG: Implementation Details
----
-## TO BE DECIDED
----
+
 **Algorithm steps:**
-1. For each variable $X_i$, parameterize $p(X_i|X_{-i})$ using a separate MLP.
-2. The weighted adjacency matrix $W$ is obtained from the first-layer weights of the MLPs via a masking scheme.
+1. For each variable $X_i$, parameterize $p(X_i|X_{-i})$ using a neural network.
+2. The weighted adjacency matrix $W$ is obtained from the internal connectivity of the NNs via a masking scheme (self-masking).
 3. Optimize the negative log-likelihood of the data subject to the continuous acyclicity constraint.
-4. Use an augmented Lagrangian method to turn the hard constraint into a soft penalty.
-5. After convergence, threshold the learned adjacency matrix to recover the DAG skeleton.
-6. Optionally apply a Preliminary Neighborhood Selection (PNS) step.
+4. Use an augmented Lagrangian method to turn the hard constraint into a soft penalty (mini-batch inner loop, early stopping on validation set, λ/μ updates).
+5. After convergence, compute the expected absolute Jacobian matrix $J$ and threshold it to recover the DAG skeleton.
 
-**API:**
+**Key design decisions:**
+- Implementation includes an internal PyTorch model `_GraNDAGModel` (ensemble of per-variable NNs).
+- Internal hyperparameters are grouped into dataclasses (`NetworkConfig`, `TrainingConfig`, `RegularizationConfig`) for readability — the public API signature is flat and unchanged.
+- Accepts a PyTorch optimizer object directly; defaults to `RMSprop(lr=1e-3)` internally as in the paper.
+- Accepts a user-provided scaler for input normalization; applied in `GraNDAG.fit` and stored as `scaler_` after fitting.
+
+---
+
+## API
+
+### `_GraNDAGModel(nn.Module)` (Internal)
+PyTorch NN ensemble for per-variable conditional distribution learning and DAG structure recovery.
+
+- **`__init__(num_vars, network_cfg: NetworkConfig, training_cfg: TrainingConfig, reg_cfg: RegularizationConfig)`**: Clones user-provided NN template $d$ times, initializes Lagrangian coefficients and optimizer.
+- **`forward(X)`**: Applies self-masking per variable, returns $\theta$ for all $d$ NNs.
+- **`train(X_tensor, val_tensor)`**: Runs augmented Lagrangian outer loop — mini-batch inner loop, early stopping on validation set, λ/μ updates — returns thresholded adjacency matrix `W_final`.
+- **`get_A()`**: Computes weighted adjacency matrix $A_\phi$ via connectivity matrix $C^{(j)} = |W_L|...|W_1|$ for each NN; diagonal forced to zero.
+- **`get_jacobian(X)`**: Computes expected absolute Jacobian matrix $J = \mathbb{E}[|\partial L/\partial X|^T]$ over data; used for final thresholding instead of $A_\phi$.
+
+### Internal dataclasses
+Grouped configuration objects used by `_GraNDAGModel`.
+
+- **`NetworkConfig`**: `net`, `output_dim`, `log_likelihood`, `scaler`
+- **`TrainingConfig`**: `batch_size`, `val_size`, `max_subproblems`, `optimizer`, `seed`
+- **`RegularizationConfig`**: `lambda_init`, `mu_init`, `mu_factor`, `omega_mu`, `h_tol`, `edge_threshold`
+
+### `GraNDAG(_BaseCausalDiscovery)` (Public API)
+Validates data, orchestrates training, applies thresholding, builds `pgmpy.DAG`.
+
 ```python
-from pgmpy.causal_discovery.base import _BaseCausalDiscovery
-import pandas as pd
-import numpy as np
-import torch
+GraNDAG(
+    # Network
+    net=None,
+    output_dim=2,
+    log_likelihood=None,
+    scaler=None,
 
-class GraNDAG(_BaseCausalDiscovery):
-    def __init__(
-        self,
-        hidden_dim: int = 16,
-        n_layers: int = 2,
-        dist_type: str = "gauss",
-        lr: float = 1e-3,
-        iterations: int = 25000,
-        pns: bool = False,
-        pns_thresh: float = 0.75,
-        lambda_init: float = 0.0,
-        mu_init: float = 1e-3,
-        omega_lambda: float = 1e-4,
-        omega_mu: float = 0.9,
-        h_threshold: float = 1e-8,
-        edge_clamp_range: float = 1e-4,
-        device: str = "cpu",
-    ):
-        ...
+    # Augmented Lagrangian
+    lambda_init=0.0,
+    mu_init=1e-3,
+    mu_factor=10.0,
+    omega_mu=0.9,
+    h_tol=1e-8,
+    max_subproblems=None,
 
-    def fit(self, X: pd.DataFrame) -> "GraNDAG":
-        ...
+    # Optimization
+    optimizer=None,
+    batch_size=64,
+    val_size=0.1,
+    seed=42,
 
-    # Internal methods
-    def _build_model(self, n_nodes: int): ...
-    def _compute_h(self, W: torch.Tensor) -> torch.Tensor: ... 
-    def _augmented_lagrangian_step(self, X, lam, mu): ...
-    def _threshold_graph(self, W: np.ndarray) -> np.ndarray: ...
-    def _to_dag(self, adj: np.ndarray, nodes: list) -> "DAG": ...
+    # Thresholding
+    edge_threshold=1e-4,
+)
 ```
+
+- `net`: `nn.Module` template, cloned $d$ times; defaults to built-in Gaussian MLP.
+- `output_dim`: Output neurons per variable; 2 for Gaussian (`mu`, `log_sigma`).
+- `log_likelihood`: Function `fn(x_j: Tensor, theta: Tensor) -> Tensor`; defaults to Gaussian.
+- `scaler`: Optional scaler for input normalization.
+- `lambda_init`: Initial Lagrangian multiplier.
+- `mu_init`: Initial penalty coefficient.
+- `mu_factor` ($\eta$): Multiplier applied to `mu` when $h(\phi)$ doesn't decrease enough.
+- `omega_mu` ($\gamma$): Threshold ratio for triggering `mu` update.
+- `h_tol`: Stop outer loop when $h(\phi) \le h_{tol}$.
+- `max_subproblems`: Hard cap on augmented Lagrangian iterations.
+- `optimizer`: Any `torch.optim.Optimizer` instance. Defaults to `RMSprop(lr=1e-3)` as in paper.
+- `batch_size`: Number of samples per mini-batch.
+- `val_size`: Fraction held out for early stopping.
+- `seed`: Seed for reproducibility.
+- `edge_threshold`: Entries in the Jacobian matrix $J$ below this are zeroed.
+
+**Methods:**
+- **`fit(X)`**: Fits the GraN-DAG model and constructs the causal DAG.
 
 **Tests (`pgmpy/tests/test_causaldiscovery/test_grandag.py`):** Synthetic DAGs with linear-Gaussian and non-linear (MLP-generated) SCMs. SHD (Structural Hamming Distance) is checked to be below a permissive threshold on small graphs.
 
