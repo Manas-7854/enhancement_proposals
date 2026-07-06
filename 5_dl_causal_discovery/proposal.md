@@ -256,14 +256,24 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 
 ## API
 
+### Helper functions (module-level, private)
+Standalone utilities used by `_GraNDAGModel` and `GraNDAG`. Defined at module scope to keep the classes focused.
+
+- **`_validate_optimizer(optimizer: str, optimizer_params: dict) -> None`** — Validates that `optimizer` resolves to a `torch.optim` class (case-insensitive) and that `optimizer_params` is a dict. Raises `ValueError` with a message listing valid optimizer names on failure. Reused as-is from CASTLE.
+- **`_dag_constraint(W: Tensor) -> Tensor`** — Computes the acyclicity constraint $h(W) = \text{tr}\!\left[\left(I + \tfrac{1}{d}\,W \odot W\right)^d\right] - d$. Returns a scalar tensor. Reused as-is from CASTLE.
+- **`_run_pns(X: np.ndarray, pns_threshold: float, seed: int) -> np.ndarray`** — Preliminary Neighbourhood Selection: fits an `ExtraTreesRegressor` (with `random_state=seed`) per variable on all other variables; returns a boolean mask of shape `(d, d)` where `True` indicates a surviving parent candidate (importance $\ge$ `pns_threshold` $\times$ mean importance). Diagonal is always `False`.
+- **`_run_cam_pruning(X: np.ndarray, adj: np.ndarray, pruning_cutoff: float) -> np.ndarray`** — CAM pruning: for each node, fits an OLS regression on its current parents; drops any parent whose coefficient has a two-sided p-value exceeding `pruning_cutoff`. Returns the pruned adjacency matrix.
+- **`_threshold_to_dag(J: Tensor, edge_threshold: float) -> Tensor`** — Iterative edge removal following Appendix A.2 of the paper: threshold entries of $J$ below `edge_threshold` to zero, then iteratively remove the lowest-weight edge that participates in a cycle until the graph is a DAG. Returns a binary adjacency tensor.
+
 ### `_GraNDAGModel(nn.Module)` (Internal)
 PyTorch NN ensemble for per-variable conditional distribution learning and DAG structure recovery.
 
-- **`__init__(num_vars, network_cfg: NetworkConfig, training_cfg: TrainingConfig, reg_cfg: RegularizationConfig)`**: Clones user-provided NN template `d` times (via `copy.deepcopy`), initializes Lagrangian coefficients ($\lambda$, $\mu$), and instantiates the optimizer from `training_cfg.optimizer` + `training_cfg.optimizer_params`.
-- **`forward(X)`**: Applies self-masking per variable (and PNS mask if active), runs each sub-network, returns distribution parameters $\theta \in \mathbb{R}^{N \times d \times \text{output\_dim}}$ for all $d$ NNs.
-- **`train(X_tensor, val_tensor)`**: Runs augmented Lagrangian outer loop — for each subproblem: mini-batch SGD inner loop, computing validation NLL each epoch, stopping when no improvement exceeding `min_loss_improvement` for `early_stop_patience` consecutive epochs; then update $\lambda^{(k+1)} = \lambda^{(k)} + \mu^{(k)} \cdot h(A_\phi^{(k)})$ and conditionally multiply $\mu$ by `mu_factor`. Returns thresholded adjacency matrix `W_final`.
-- **`get_A()`**: Computes weighted adjacency matrix $A_\phi$ via connectivity matrix $C^{(j)} = |W_L^{(j)}| \cdots |W_1^{(j)}|$ for each NN $j$; row $j$ of $A_\phi$ is the sum across output neurons of $C^{(j)}$; diagonal forced to zero.
-- **`get_jacobian(X)`**: Computes expected absolute Jacobian matrix $J_{ij} = \mathbb{E}[|\partial f_j / \partial x_i|]$ over the full dataset using `torch.autograd.grad` with `create_graph=False`; used for final thresholding instead of $A_\phi$.
+- **`__init__(self, num_vars: int, network_cfg: NetworkConfig, train_cfg: TrainingConfig, reg_cfg: RegularizationConfig)`**: Clones user-provided NN template `num_vars` times (via `copy.deepcopy`), registers self-masks and optional PNS mask as buffers, initializes Lagrangian coefficients ($\lambda$, $\mu$), instantiates the optimizer from `train_cfg.optimizer` + `train_cfg.optimizer_params`, and sets the random seed via `train_cfg.seed`.
+- **`forward(self, X) -> Tensor`**: Applies self-masking per variable (and PNS mask if active), runs each sub-network, returns distribution parameters $\theta \in \mathbb{R}^{N \times d \times \text{output\_dim}}$ for all $d$ NNs.
+- **`train(self, X_tensor=True, val_tensor=None)`**: Overloaded following the same pattern as CASTLE's `_CASTLEModel.train()` — when called with a bool (`True`/`False`), delegates to `nn.Module.train(mode)` for train/eval mode switching; when called with a `Tensor` as the first argument, runs the actual training loop: augmented Lagrangian outer loop, where each subproblem runs a mini-batch SGD inner loop computing validation NLL each epoch, stopping when no improvement exceeding `min_loss_improvement` for `early_stop_patience` consecutive epochs. After each subproblem, calls `_update_lagrangian`. Returns thresholded adjacency matrix `W_final`.
+- **`get_A(self) -> Tensor`**: Computes weighted adjacency matrix $A_\phi$ via connectivity matrix $C^{(j)} = |W_L^{(j)}| \cdots |W_1^{(j)}|$ for each NN $j$; row $j$ of $A_\phi$ is the sum across output neurons of $C^{(j)}$; diagonal forced to zero.
+- **`get_jacobian(self, X) -> Tensor`**: Computes expected absolute Jacobian matrix $J_{ij} = \mathbb{E}[|\partial f_j / \partial x_i|]$ over the full dataset using `torch.autograd.grad` with `create_graph=False`; used for final thresholding instead of $A_\phi$.
+- **`_update_lagrangian(self, h_val: float, h_prev: float) -> None`** — Updates the Lagrangian coefficients after each subproblem per Eq. 14 of the paper: $\lambda \leftarrow \lambda + \mu \cdot h_{\text{val}}$; if $h_{\text{val}} > \omega_\mu \cdot h_{\text{prev}}$ then $\mu \leftarrow \eta \cdot \mu$.
 
 ### Internal dataclasses
 Grouped configuration objects used by `_GraNDAGModel`.
@@ -273,7 +283,7 @@ Grouped configuration objects used by `_GraNDAGModel`.
 - **`RegularizationConfig`**: `lambda_init`, `mu_init`, `mu_factor`, `omega_mu`, `h_tol`, `edge_threshold`
 
 ### `GraNDAG(_BaseCausalDiscovery)` (Public API)
-Validates data, orchestrates PNS → training → thresholding → CAM pruning, and builds the `pgmpy.DAG`.
+Validates data, orchestrates PNS → training → thresholding → CAM pruning, and builds the `pgmpy.DAG`. Calls `_check_soft_dependencies` on import to verify `torch` availability.
 
 ```python
 GraNDAG(
@@ -343,15 +353,24 @@ Between subproblems the Lagrangian coefficients are updated as:
 - `pruning_cutoff`: If not `None`, a CAM pruning post-processing step is applied after Jacobian thresholding: for each node, an OLS regression is fit on its current parents; any parent whose coefficient has a two-sided p-value exceeding `pruning_cutoff` is dropped. This removes statistically insignificant edges. Requires `scikit-learn`.
 
 **Methods:**
-- **`fit(X)`**: Runs the full pipeline — PNS pre-filter (if `pns_threshold` is set) → augmented Lagrangian training loop with per-subproblem early stopping → Jacobian thresholding at `edge_threshold` → CAM pruning (if `pruning_cutoff` is set) → builds and stores the `pgmpy.DAG`.
+- **`__init__(self, **20 params)`** — Mirrors CASTLE's flat signature. Stores all hyperparameters as instance attributes and calls `_check_soft_dependencies` to verify `torch` (and optionally `sklearn` if `pns_threshold` or `pruning_cutoff` are set).
+- **`_fit(self, X: pd.DataFrame)`** — Called by the base class `fit(X)`. Executes the full pipeline:
+  - **Step 0 — Validate**: Call `_validate_optimizer(optimizer, optimizer_params)`, validate `X` (numeric, ≥ 2 columns), run `_run_pns(X, pns_threshold, seed)` if `pns_threshold` is set.
+  - **Step 1 — Build configs**: Construct `NetworkConfig`, `TrainingConfig`, `RegularizationConfig` dataclasses from stored hyperparameters.
+  - **Step 2 — Train**: Convert `X` to tensors (apply `scaler` if provided, split off `val_size` fraction), instantiate `_GraNDAGModel(num_vars, ...)`, call `.train(X_tensor, val_tensor)` to run the augmented Lagrangian loop.
+  - **Step 3 — Post-process**: Compute Jacobian via `model_.get_jacobian(X_tensor)`, apply `_threshold_to_dag(J, edge_threshold)`, run `_run_cam_pruning(X, adj, pruning_cutoff)` if `pruning_cutoff` is set, build `adjacency_matrix_` and `causal_graph_`.
 
 **Attributes set after `fit`:**
-- `n_features_in_`: Number of input features (variables) seen during fit.
-- `feature_names_in_`: Feature names from the input DataFrame.
 - `causal_graph_`: Learned causal DAG as a `pgmpy.base.DAG`.
 - `adjacency_matrix_`: Thresholded (and optionally pruned) adjacency matrix as a Pandas DataFrame indexed by feature names.
 - `model_`: Internal `_GraNDAGModel` instance used for training.
 - `scaler_`: Fitted scaler used to normalize inputs during training (set only when `scaler` is provided).
+- `n_features_in_`: Number of input features (variables) seen during fit.
+- `feature_names_in_`: Feature names from the input DataFrame.
+- `cols_`: Alias for `feature_names_in_`; used internally for column-order bookkeeping.
+- `network_config_`: The `NetworkConfig` dataclass instance constructed during fit.
+- `train_config_`: The `TrainingConfig` dataclass instance constructed during fit.
+- `reg_config_`: The `RegularizationConfig` dataclass instance constructed during fit.
 - `pns_mask_`: Boolean mask array of shape `(d, d)` indicating which parent candidates survived PNS (set only when `pns_threshold` is provided).
 
 ---
