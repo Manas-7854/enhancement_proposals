@@ -238,7 +238,7 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 1. For each variable $X_i$, parameterize $p(X_i|X_{-i})$ using a neural network.
 2. *(Optional — PNS pre-filter)* If `pns_threshold` is set, fit an `ExtraTreesRegressor` per variable to compute feature importances; mask out parent candidates with importance below `pns_threshold × mean_importance`, reducing the effective input dimension before optimization.
 3. The weighted adjacency matrix $A_\phi$ is obtained from the internal connectivity of the NNs via a masking scheme (self-masking). For each NN $j$, the connectivity matrix $C^{(j)} = |W_L^{(j)}| \cdots |W_1^{(j)}|$ (product of absolute weight matrices across all layers) yields one row of $A_\phi$; the diagonal is forced to zero.
-4. Optimize the negative log-likelihood of the data subject to the continuous acyclicity constraint $h(A_\phi) = \text{tr}\!\left[\left(I + \tfrac{1}{d}\,A_\phi \odot A_\phi\right)^d\right] - d = 0$ using an augmented Lagrangian method (outer loop over subproblems, mini-batch SGD inner loop with early stopping on a held-out validation split, $\lambda$/$\mu$ updates between subproblems).
+4. Optimize the negative log-likelihood of the data subject to the continuous acyclicity constraint $h(\phi) = \text{tr}(e^{A_\phi}) - d = 0$ using an augmented Lagrangian method (outer loop over subproblems, mini-batch SGD inner loop with early stopping on a held-out validation split, $\lambda$/$\mu$ updates between subproblems). Note: unlike CASTLE's $h(W) = \text{tr}(e^{W \odot W}) - d$, GraN-DAG does **not** element-wise-square $A_\phi$ because the connectivity product $C^{(j)} = |W_L| \cdots |W_1|$ already produces non-negative entries.
 5. After convergence, compute the expected absolute Jacobian matrix $J_{ij} = \mathbb{E}\!\left[\left|\tfrac{\partial f_j}{\partial x_i}\right|\right]$ over the training data via `torch.autograd` and threshold it at `edge_threshold` to recover the DAG skeleton. The Jacobian is preferred over $A_\phi$ because it measures the actual functional sensitivity of each output to each input, accounting for weight cancellations and non-linear saturation that the raw connectivity product cannot capture.
 6. *(Optional — CAM pruning)* If `pruning_cutoff` is set, regress each node on its current parents (OLS); drop any parent whose coefficient has a p-value exceeding `pruning_cutoff`, removing statistically insignificant edges.
 7. Build the final `pgmpy.DAG` from the surviving edges.
@@ -260,7 +260,7 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 Standalone utilities used by `_GraNDAGModel` and `GraNDAG`. Defined at module scope to keep the classes focused.
 
 - **`_validate_optimizer(optimizer: str, optimizer_params: dict) -> None`** — Validates that `optimizer` resolves to a `torch.optim` class (case-insensitive) and that `optimizer_params` is a dict. Raises `ValueError` with a message listing valid optimizer names on failure. Reused as-is from CASTLE.
-- **`_dag_constraint(W: Tensor) -> Tensor`** — Computes the acyclicity constraint $h(W) = \text{tr}\!\left[\left(I + \tfrac{1}{d}\,W \odot W\right)^d\right] - d$. Returns a scalar tensor. Reused as-is from CASTLE.
+- **`_dag_constraint(W: Tensor, square: bool = True) -> Tensor`** — Computes the acyclicity constraint via `torch.linalg.matrix_exp`. When `square=True` (CASTLE), computes $h(W) = \text{tr}(e^{W \odot W}) - d$ because $W$ can contain negative entries. When `square=False` (GraN-DAG), computes $h(W) = \text{tr}(e^{W}) - d$ directly since $A_\phi$ is already non-negative. Shared between CASTLE and GraN-DAG; GraN-DAG calls with `square=False`.
 - **`_run_pns(X: np.ndarray, pns_threshold: float, seed: int) -> np.ndarray`** — Preliminary Neighbourhood Selection: fits an `ExtraTreesRegressor` (with `random_state=seed`) per variable on all other variables; returns a boolean mask of shape `(d, d)` where `True` indicates a surviving parent candidate (importance $\ge$ `pns_threshold` $\times$ mean importance). Diagonal is always `False`.
 - **`_run_cam_pruning(X: np.ndarray, adj: np.ndarray, pruning_cutoff: float) -> np.ndarray`** — CAM pruning: for each node, fits an OLS regression on its current parents; drops any parent whose coefficient has a two-sided p-value exceeding `pruning_cutoff`. Returns the pruned adjacency matrix.
 - **`_threshold_to_dag(J: Tensor, edge_threshold: float) -> Tensor`** — Iterative edge removal following Appendix A.2 of the paper: threshold entries of $J$ below `edge_threshold` to zero, then iteratively remove the lowest-weight edge that participates in a cycle until the graph is a DAG. Returns a binary adjacency tensor.
@@ -321,9 +321,11 @@ Augmented Lagrangian objective being minimized per subproblem:
 
 $$\min_\phi \; \underbrace{-\frac{1}{N}\sum_{i=1}^{N}\sum_{j=1}^{d} \log p\!\left(x_{ij} \mid \theta_j(\mathbf{x}_i;\,\phi)\right)}_{\text{negative log-likelihood}} \;+\; \lambda\, h(A_\phi) \;+\; \frac{\mu}{2}\, h(A_\phi)^2$$
 
-where the acyclicity constraint is:
+where the acyclicity constraint (Eq. 9 of the paper) is:
 
-$$h(A_\phi) = \text{tr}\!\left[\left(I + \tfrac{1}{d}\, A_\phi \odot A_\phi\right)^d\right] - d = 0$$
+$$h(\phi) = \text{tr}\!\left(e^{A_\phi}\right) - d = 0$$
+
+Note: $A_\phi$ is already entry-wise non-negative (built from the connectivity product $C^{(j)} = |W_L| \cdots |W_1|$), so no element-wise squaring is needed — unlike CASTLE's $h(W) = \text{tr}(e^{W \odot W}) - d$ where $W$ can be negative.
 
 Between subproblems the Lagrangian coefficients are updated as:
 - $\lambda^{(k+1)} = \lambda^{(k)} + \mu^{(k)} \cdot h\!\left(A_\phi^{(k)}\right)$
