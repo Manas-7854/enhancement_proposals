@@ -236,11 +236,11 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 
 **Algorithm steps:**
 1. For each variable $X_i$, parameterize $p(X_i|X_{-i})$ using a neural network.
-2. *(Optional — PNS pre-filter)* If `pns_threshold` is set, fit an `ExtraTreesRegressor` per variable to compute feature importances; mask out parent candidates with importance below `pns_threshold × mean_importance`, reducing the effective input dimension before optimization.
+2. *(Optional — PNS pre-filter)* If `pns_threshold` is set, fit a tree-based sklearn estimator (default `ExtraTreesRegressor`; any estimator exposing `feature_importances_` is accepted) per variable to compute feature importances; mask out parent candidates with importance below `pns_threshold × mean_importance`, reducing the effective input dimension before optimization.
 3. The weighted adjacency matrix $A_\phi$ is obtained from the internal connectivity of the NNs via a masking scheme (self-masking). For each NN $j$, the connectivity matrix $C^{(j)} = |W_L^{(j)}| \cdots |W_1^{(j)}|$ (product of absolute weight matrices across all layers) yields one row of $A_\phi$; the diagonal is forced to zero.
 4. Optimize the negative log-likelihood of the data subject to the continuous acyclicity constraint $h(\phi) = \text{tr}(e^{A_\phi}) - d = 0$ using an augmented Lagrangian method (outer loop over subproblems, mini-batch SGD inner loop with early stopping on a held-out validation split, $\lambda$/$\mu$ updates between subproblems). Note: unlike CASTLE's $h(W) = \text{tr}(e^{W \odot W}) - d$, GraN-DAG does **not** element-wise-square $A_\phi$ because the connectivity product $C^{(j)} = |W_L| \cdots |W_1|$ already produces non-negative entries.
 5. After convergence, compute the expected absolute Jacobian matrix $J_{ij} = \mathbb{E}\!\left[\left|\tfrac{\partial f_j}{\partial x_i}\right|\right]$ over the training data via `torch.autograd` and threshold it at `edge_threshold` to recover the DAG skeleton. The Jacobian is preferred over $A_\phi$ because it measures the actual functional sensitivity of each output to each input, accounting for weight cancellations and non-linear saturation that the raw connectivity product cannot capture.
-6. *(Optional — CAM pruning)* If `pruning_cutoff` is set, regress each node on its current parents (OLS); drop any parent whose coefficient has a p-value exceeding `pruning_cutoff`, removing statistically insignificant edges.
+6. *(Optional — CAM pruning)* If `pruning_cutoff` is set, apply CAM pruning using pgmpy's CAM score implementation (available via an existing PR); drop any parent whose score has a p-value exceeding `pruning_cutoff`, removing statistically insignificant edges.
 7. Build the final `pgmpy.DAG` from the surviving edges.
 
 **Key design decisions:**
@@ -249,8 +249,8 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via `utils.gen_
 - Accepts an optimizer as a **string name** (`"rmsprop"`, `"adam"`, etc.) plus an optional `optimizer_params` dict; the string is resolved to the corresponding `torch.optim` class internally and instantiated with `optimizer_params`. This avoids the complexity of passing an unbound optimizer object and keeps the API serializable.
 - Accepts a user-provided scaler for input normalization (for example, `sklearn.preprocessing.StandardScaler`); it must implement `fit(X)` and `transform(X)`. Applied in `GraNDAG.fit`, fit on training data only, and stored as `scaler_` after fitting.
 - Logs training metrics to TensorBoard when `tensorboard_log_dir` is provided; no verbose printing.
-- Optional **Preliminary Neighbourhood Selection (PNS)** via `pns_threshold` reduces the search space before training, following the GraN-DAG paper's recommended pipeline.
-- Optional **CAM pruning** via `pruning_cutoff` removes statistically insignificant edges after structure recovery, as described in the paper's post-processing.
+- Optional **Preliminary Neighbourhood Selection (PNS)** via `pns_threshold` reduces the search space before training, following the GraN-DAG paper's recommended pipeline. The estimator used for feature importance is configurable — any sklearn estimator exposing a `feature_importances_` attribute (e.g., `ExtraTreesRegressor`, `RandomForestRegressor`, `GradientBoostingRegressor`) is accepted; defaults to `ExtraTreesRegressor`.
+- Optional **CAM pruning** via `pruning_cutoff` removes statistically insignificant edges after structure recovery, as described in the paper's post-processing. Will reuse pgmpy's existing CAM score implementation (open PR) if possible, avoiding a standalone reimplementation.
 
 ---
 
@@ -261,8 +261,8 @@ Standalone utilities used by `_GraNDAGModel` and `GraNDAG`. Defined at module sc
 
 - **`_validate_optimizer(optimizer: str, optimizer_params: dict) -> None`** — Validates that `optimizer` resolves to a `torch.optim` class (case-insensitive) and that `optimizer_params` is a dict. Raises `ValueError` with a message listing valid optimizer names on failure. Reused as-is from CASTLE.
 - **`_dag_constraint(W: Tensor, square: bool = True) -> Tensor`** — Computes the acyclicity constraint via `torch.linalg.matrix_exp`. When `square=True` (CASTLE), computes $h(W) = \text{tr}(e^{W \odot W}) - d$ because $W$ can contain negative entries. When `square=False` (GraN-DAG), computes $h(W) = \text{tr}(e^{W}) - d$ directly since $A_\phi$ is already non-negative. Shared between CASTLE and GraN-DAG; GraN-DAG calls with `square=False`.
-- **`_run_pns(X: np.ndarray, pns_threshold: float, seed: int) -> np.ndarray`** — Preliminary Neighbourhood Selection: fits an `ExtraTreesRegressor` (with `random_state=seed`) per variable on all other variables; returns a boolean mask of shape `(d, d)` where `True` indicates a surviving parent candidate (importance $\ge$ `pns_threshold` $\times$ mean importance). Diagonal is always `False`.
-- **`_run_cam_pruning(X: np.ndarray, adj: np.ndarray, pruning_cutoff: float) -> np.ndarray`** — CAM pruning: for each node, fits an OLS regression on its current parents; drops any parent whose coefficient has a two-sided p-value exceeding `pruning_cutoff`. Returns the pruned adjacency matrix.
+- **`_run_pns(X: np.ndarray, pns_threshold: float, seed: int, estimator=None) -> np.ndarray`** — Preliminary Neighbourhood Selection: fits the provided estimator (default `ExtraTreesRegressor(random_state=seed)`) per variable on all other variables. The estimator must expose a `feature_importances_` attribute after fitting; a `TypeError` is raised otherwise. Returns a boolean mask of shape `(d, d)` where `True` indicates a surviving parent candidate (importance $\ge$ `pns_threshold` $\times$ mean importance). Diagonal is always `False`.
+- **`_run_cam_pruning(X: np.ndarray, adj: np.ndarray, pruning_cutoff: float) -> np.ndarray`** — CAM pruning: delegates to pgmpy's CAM score implementation (open PR) to score each parent; drops any parent whose score has a p-value exceeding `pruning_cutoff`. Returns the pruned adjacency matrix. Falls back to a standalone OLS implementation if the pgmpy CAM module is not yet available.
 - **`_threshold_to_dag(J: Tensor, edge_threshold: float) -> Tensor`** — Iterative edge removal following Appendix A.2 of the paper: threshold entries of $J$ below `edge_threshold` to zero, then iteratively remove the lowest-weight edge that participates in a cycle until the graph is a DAG. Returns a binary adjacency tensor.
 
 ### `_GraNDAGModel(nn.Module)` (Internal)
@@ -280,7 +280,7 @@ Grouped configuration objects used by `_GraNDAGModel`.
 
 - **`NetworkConfig`**: `net`, `output_dim`, `log_likelihood`, `scaler`
 - **`TrainingConfig`**: `optimizer`, `optimizer_params`, `batch_size`, `val_size`, `min_loss_improvement`, `early_stop_patience`, `max_subproblems`, `seed`
-- **`RegularizationConfig`**: `lambda_init`, `mu_init`, `mu_factor`, `omega_mu`, `h_tol`, `edge_threshold`
+- **`RegularizationConfig`**: `dag_multiplier_init`, `dag_penalty`, `dag_penalty_growth_factor`, `dag_penalty_growth_threshold`, `dag_constraint_tol`, `edge_threshold`
 
 ### `GraNDAG(_BaseCausalDiscovery)` (Public API)
 Validates data, orchestrates PNS → training → thresholding → CAM pruning, and builds the `pgmpy.DAG`. Calls `_check_soft_dependencies` on import to verify `torch` availability.
@@ -294,11 +294,11 @@ GraNDAG(
     scaler=None,
 
     # Augmented Lagrangian
-    lambda_init=0.0,
-    mu_init=1e-3,
-    mu_factor=10.0,
-    omega_mu=0.9,
-    h_tol=1e-8,
+    dag_multiplier_init=0.0,
+    dag_penalty=1e-3,
+    dag_penalty_growth_factor=10.0,
+    dag_penalty_growth_threshold=0.9,
+    dag_constraint_tol=1e-8,
     max_subproblems=None,
 
     # Optimization
@@ -337,12 +337,12 @@ Between subproblems the Lagrangian coefficients are updated as:
 - `output_dim`: Number of output neurons per sub-network. Determines the number of distribution parameters produced per variable: 2 for Gaussian ($\mu$, $\log\sigma$), 1 for a distribution parameterized by its mean alone. Must match the expectation of the `log_likelihood` function.
 - `log_likelihood`: Callable with signature `fn(x_j: Tensor[batch_size], theta: Tensor[batch_size, output_dim]) -> Tensor[batch_size]` that returns the per-sample log-probability of observed values `x_j` given distribution parameters `theta`. Defaults to Gaussian: $\log \mathcal{N}(x_j;\, \mu,\, e^{\log\sigma})$.
 - `scaler`: Optional scaler for input normalization (for example, `sklearn.preprocessing.StandardScaler`). It must implement `fit(X)` and `transform(X)`; `inverse_transform(X)` is optional for user-side de-scaling. If provided, it is fit on training data only and stored as `scaler_` after fitting.
-- `lambda_init` ($\lambda^{(0)}$): Initial Lagrangian multiplier for the acyclicity equality constraint. Starts at 0; increased automatically each outer iteration.
-- `mu_init` ($\mu^{(0)}$): Initial penalty coefficient on the squared acyclicity violation $h(A_\phi)^2$.
-- `mu_factor` ($\eta$): Multiplier applied to `mu` when $h(A_\phi)$ has not decreased by at least `omega_mu` relative to the previous subproblem.
-- `omega_mu` ($\gamma$): Threshold ratio for triggering `mu` update. If $h^{(k)} > \gamma \cdot h^{(k-1)}$, then $\mu$ is multiplied by $\eta$.
-- `h_tol`: Stop the outer loop when $h(A_\phi) \le h_{tol}$, indicating the acyclicity constraint is approximately satisfied.
-- `max_subproblems`: Hard cap on the number of augmented Lagrangian outer iterations. `None` means no cap — the loop runs until $h(A_\phi) \le h_{tol}$.
+- `dag_multiplier_init` ($\lambda^{(0)}$): Initial Lagrangian multiplier for the acyclicity equality constraint. Starts at 0; increased automatically each outer iteration via $\lambda \leftarrow \lambda + \mu \cdot h$.
+- `dag_penalty` ($\mu^{(0)}$): Initial quadratic penalty coefficient on the acyclicity violation $h(A_\phi)^2$. Same role as CASTLE's `dag_penalty` ($\rho$) — understood to be a starting value that is increased automatically during training.
+- `dag_penalty_growth_factor` ($\eta$): Multiplier applied to the penalty when $h(A_\phi)$ has not decreased by at least `dag_penalty_growth_threshold` relative to the previous subproblem.
+- `dag_penalty_growth_threshold` ($\gamma$): Ratio threshold for triggering a penalty increase. If $h^{(k)} > \gamma \cdot h^{(k-1)}$, then the penalty is multiplied by $\eta$.
+- `dag_constraint_tol`: Stop the outer loop when $h(A_\phi) \le$ `dag_constraint_tol`, indicating the acyclicity constraint is approximately satisfied.
+- `max_subproblems`: Hard cap on the number of augmented Lagrangian outer iterations. `None` means no cap — the loop runs until $h(A_\phi) \le$ `dag_constraint_tol`.
 - `optimizer`: String name of a `torch.optim` optimizer class (`"rmsprop"`, `"adam"`, `"sgd"`, etc.), resolved internally via `getattr(torch.optim, name)`. Defaults to `"rmsprop"` as in the paper. Case-insensitive matching is applied.
 - `optimizer_params`: Dict of keyword arguments forwarded to the optimizer constructor (e.g., `{"lr": 1e-3, "weight_decay": 1e-5}`). Defaults to `{"lr": 1e-3}` when `None`.
 - `batch_size`: Number of samples per mini-batch during the inner optimization loop.
@@ -351,8 +351,8 @@ Between subproblems the Lagrangian coefficients are updated as:
 - `early_stop_patience`: Number of consecutive epochs without improvement (exceeding `min_loss_improvement`) before the current subproblem is stopped early and the outer loop advances.
 - `seed`: Seed for reproducibility (controls weight initialization, data shuffling, and validation split).
 - `edge_threshold`: Entries in the Jacobian matrix $J$ below this value are zeroed in the final adjacency matrix.
-- `pns_threshold`: If not `None`, a Preliminary Neighbourhood Selection step is run before training: an `ExtraTreesRegressor` (with `random_state=seed`) is fit per variable on all other variables; parent candidates whose feature importance falls below `pns_threshold × mean_importance` for that variable are masked out (their input connections are permanently zeroed). This reduces the search space for high-dimensional problems. Requires `scikit-learn`.
-- `pruning_cutoff`: If not `None`, a CAM pruning post-processing step is applied after Jacobian thresholding: for each node, an OLS regression is fit on its current parents; any parent whose coefficient has a two-sided p-value exceeding `pruning_cutoff` is dropped. This removes statistically insignificant edges. Requires `scikit-learn`.
+- `pns_threshold`: If not `None`, a Preliminary Neighbourhood Selection step is run before training: a tree-based sklearn estimator (default `ExtraTreesRegressor` with `random_state=seed`) is fit per variable on all other variables; parent candidates whose feature importance falls below `pns_threshold × mean_importance` for that variable are masked out (their input connections are permanently zeroed). Any estimator exposing `feature_importances_` after fitting is accepted (e.g., `RandomForestRegressor`, `GradientBoostingRegressor`). This reduces the search space for high-dimensional problems. Requires `scikit-learn`.
+- `pruning_cutoff`: If not `None`, a CAM pruning post-processing step is applied after Jacobian thresholding, using pgmpy's CAM score implementation (open PR) where available. For each node, parents whose score has a p-value exceeding `pruning_cutoff` are dropped, removing statistically insignificant edges.
 
 **Methods:**
 - **`__init__(self, **20 params)`** — Mirrors CASTLE's flat signature. Stores all hyperparameters as instance attributes and calls `_check_soft_dependencies` to verify `torch` (and optionally `sklearn` if `pns_threshold` or `pruning_cutoff` are set).
@@ -475,7 +475,8 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via non-linear 
 ### 5. PNS & CAM Pruning Tests
 
 - **PNS reduces parent set**: With `pns_threshold=1.0` (aggressive), at least one input is masked out per variable (for a dataset with redundant features).
-- **PNS `None` skips the step**: When `pns_threshold=None`, no `ExtraTreesRegressor` is fitted and `pns_mask_` is not set.
+- **PNS `None` skips the step**: When `pns_threshold=None`, no estimator is fitted and `pns_mask_` is not set.
+- **PNS accepts custom estimator**: Passing a `RandomForestRegressor` as the PNS estimator works end-to-end; passing an estimator without `feature_importances_` (e.g., `LinearRegression`) raises `TypeError`.
 - **PNS mask is applied during training**: After PNS masking, the masked entries in `get_A()` remain zero throughout training.
 - **CAM pruning removes edges**: With `pruning_cutoff=0.5` (permissive) on a sparse ground-truth DAG, the pruned graph has fewer or equal edges compared to the unpruned Jacobian-thresholded graph.
 - **CAM `None` skips the step**: When `pruning_cutoff=None`, no pruning regression is run.
@@ -497,8 +498,8 @@ All tests use fixed `seed=42` and small synthetic DAGs generated via non-linear 
 
 - **Negative log-likelihood decreases**: Record NLL at start and end of training; assert final < initial.
 - **$h(A_\phi)$ trends toward zero**: Record $h(A_\phi)$ at the first and last subproblem; assert final $h < 0.1 \times$ initial $h$.
-- **$\mu$ increases correctly**: When $h(A_\phi)$ fails to decrease by $\omega_\mu$ between subproblems, verify that $\mu$ is multiplied by `mu_factor`.
-- **$\lambda$ update is correct**: After each subproblem, verify $\lambda^{(k+1)} = \lambda^{(k)} + \mu^{(k)} \cdot h(A_\phi^{(k)})$.
+- **`dag_penalty` increases correctly**: When $h(A_\phi)$ fails to decrease by `dag_penalty_growth_threshold` ($\gamma$) between subproblems, verify that `dag_penalty` ($\mu$) is multiplied by `dag_penalty_growth_factor` ($\eta$).
+- **`dag_multiplier_init` update is correct**: After each subproblem, verify $\lambda^{(k+1)} = \lambda^{(k)} + \mu^{(k)} \cdot h(A_\phi^{(k)})$.
 - **SHD is below threshold**: On a 4-node ground-truth DAG with 500 samples, assert SHD ≤ 4 (permissive threshold for a non-linear SCM).
 - **Reproducibility**: Two identical runs produce byte-identical adjacency matrices.
 
